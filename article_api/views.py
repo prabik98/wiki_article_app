@@ -1,6 +1,7 @@
 import os, re
 
 import google.generativeai as genai
+from jsonschema import ValidationError
 import requests
 from dotenv import load_dotenv
 from rest_framework import status, viewsets
@@ -39,12 +40,14 @@ class RegisterUserView(APIView):
 
 class ArticleViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
-
     def list(self, request):
-        user = request.user
-        articles = Article.objects.filter(user=user).all()
-        serializer = ArticleSerializer(articles, many=True)
-        return Response(serializer.data)
+        try:
+            user = request.user
+            articles = Article.objects.filter(user=user).all()
+            serializer = ArticleSerializer(articles, many=True)
+            return Response(serializer.data, status=200)
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
 
     def create(self, request):
         user = request.user
@@ -58,7 +61,6 @@ class ArticleViewSet(viewsets.ViewSet):
                 model = genai.GenerativeModel("gemini-1.5-flash")
                 prompt = f"Generate relevant tags for a wikipedia article titled '{title}' with snippet '{snippet}'. Your output should only contain tags separated by comma and no extra space."
                 response = model.generate_content(prompt)
-                # tags = response.text.strip().split(",")
                 tags = [tag.strip() for tag in response.text.split(",") if tag.strip()]
         except Exception as e:
             return Response(
@@ -77,37 +79,59 @@ class ArticleViewSet(viewsets.ViewSet):
             tag, _ = Tag.objects.get_or_create(name=tag_name.strip())
             tag_objects.append(tag)
         return tag_objects
-
     def delete(self, request, pk):
-        article = Article.objects.get(pk=pk)
-        article.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        try:
+            article = Article.objects.get(pk=pk)
+            article.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Article.DoesNotExist:
+            return Response({"error": "Article not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=["delete"])
     def delete_tag(self, request, pk):
-        serializer = ArticleDeleteTagSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        article = Article.objects.get(pk=pk)
-        tag_object = Tag.objects.get(name=serializer.data["name"])
-        if tag_object:
-            article.tags.remove(tag_object)
-        return Response(ArticleSerializer(article).data, status=status.HTTP_200_OK)
+        try:
+            serializer = ArticleDeleteTagSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            article = Article.objects.get(pk=pk)
+            tag_object = Tag.objects.get(name=serializer.validated_data["name"])
+            
+            if tag_object:
+                article.tags.remove(tag_object)
+            
+            return Response(ArticleSerializer(article).data, status=status.HTTP_200_OK)
+        except Article.DoesNotExist:
+            return Response({"error": "Article not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Tag.DoesNotExist:
+            return Response({"error": "Tag not found."}, status=status.HTTP_404_NOT_FOUND)
+        except ValidationError as e:
+            return Response({"error": e.detail}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=["post"])
     def add_tag(self, request, pk):
-        article = Article.objects.get(pk=pk)
-        tag_object, _ = Tag.objects.get_or_create(name=request.data["name"])
-        article.tags.add(tag_object)
-        return Response(ArticleSerializer(article).data, status=status.HTTP_201_CREATED)
+        try:
+            article = Article.objects.get(pk=pk)
+            tag_object, _ = Tag.objects.get_or_create(name=request.data.get("name"))
+            article.tags.add(tag_object)
+            return Response(ArticleSerializer(article).data, status=status.HTTP_201_CREATED)
+        except Article.DoesNotExist:
+            return Response({"error": "Article not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=["post"])
     def search(self, request):
-        serializer = WikipediaSearchSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        query = serializer.validated_data["query"]
-
-        # Wikipedia API request
         try:
+            # Validate input
+            serializer = WikipediaSearchSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            query = serializer.validated_data["query"]
+
+            # Wikipedia API request
             response = requests.get(
                 "https://en.wikipedia.org/w/api.php",
                 params={
@@ -117,20 +141,24 @@ class ArticleViewSet(viewsets.ViewSet):
                     "format": "json",
                 },
             )
+            response.raise_for_status()
+            
+            data = response.json().get("query", {}).get("search", [])
+            cleaned_data = [
+                {
+                    **entry,
+                    "snippet": re.sub(r"</?span.*?>", "", entry.get("snippet", "")).replace("&quot;", "")
+                }
+                for entry in data
+            ]
+            return Response(cleaned_data, status=status.HTTP_200_OK)
+
+        except ValidationError as e:
+            return Response({"error": e.detail}, status=status.HTTP_400_BAD_REQUEST)
         except requests.RequestException as e:
             return Response(
                 {"error": f"An error occurred while connecting to Wikipedia: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-
-        if response.status_code != 200:
-            return Response(
-                {"error": "Failed to fetch data from Wikipedia."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        data = response.json().get("query", {}).get("search", [])
-        for entry in data:
-            entry["snippet"] = re.sub(r"</?span.*?>", "", entry["snippet"])
-            entry["snippet"] = entry["snippet"].replace("&quot;", "")
-        return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
